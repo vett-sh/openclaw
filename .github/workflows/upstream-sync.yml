@@ -1,0 +1,154 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git
+          git fetch upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          LOCAL=$(git rev-parse origin/main)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            COUNT=$(git rev-list origin/main..upstream/main --count)
+            SINCE=$(git log origin/main..upstream/main --format='%ai' --reverse | head -1 | cut -d' ' -f1)
+            UNTIL=$(git log upstream/main -1 --format='%ai' | cut -d' ' -f1)
+            echo "commit_count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "since=$SINCE" >> "$GITHUB_OUTPUT"
+            echo "until=$UNTIL" >> "$GITHUB_OUTPUT"
+            echo "$COUNT new upstream commits ($SINCE to $UNTIL)"
+          fi
+
+      - name: Create sync branch and merge
+        if: steps.check.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          git checkout -B upstream-sync origin/main
+          if git merge upstream/main --no-edit; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ', ' | sed 's/,$//')
+            echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit --no-edit -m "chore: merge upstream (conflicts present)"
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.up_to_date == 'false'
+        run: git push --force origin upstream-sync
+
+      - name: Find existing PR
+        if: steps.check.outputs.up_to_date == 'false'
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          PR_NUMBER=$(gh api repos/${{ github.repository }}/pulls \
+            --jq '[.[] | select(.head.ref=="upstream-sync" and .base.ref=="main" and .state=="open")] | .[0].number // empty' \
+            2>/dev/null || true)
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build PR body
+        if: steps.check.outputs.up_to_date == 'false'
+        id: body
+        env:
+          COUNT: ${{ steps.check.outputs.commit_count }}
+          SINCE: ${{ steps.check.outputs.since }}
+          UNTIL: ${{ steps.check.outputs.until }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+        run: |
+          LOCAL_SHA=$(git rev-parse origin/main)
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+
+          {
+            echo "## Upstream Sync"
+            echo ""
+            echo "**${COUNT} new commit(s)** from \`openclaw/openclaw\` (${SINCE} to ${UNTIL})"
+            echo ""
+            echo "[Compare upstream changes](https://github.com/openclaw/openclaw/compare/${LOCAL_SHA}...${UPSTREAM_SHA})"
+
+            if [ "$CONFLICT" = "true" ]; then
+              echo ""
+              echo "---"
+              echo ""
+              echo "> **Warning: Merge conflicts detected** — manual resolution required."
+              echo ""
+              echo "Conflicted files: \`${CONFLICT_FILES}\`"
+            fi
+          } > /tmp/pr-body.md
+
+      - name: Create or update PR
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          PR_EXISTS: ${{ steps.find_pr.outputs.exists }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.number }}
+        run: |
+          TITLE="chore: sync upstream openclaw/openclaw"
+          BODY=$(cat /tmp/pr-body.md)
+          REPO="${{ github.repository }}"
+
+          if [ "$PR_EXISTS" = "true" ]; then
+            # Update existing PR via REST API
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              -X PATCH \
+              -f title="$TITLE" \
+              -f body="$BODY" \
+              --silent
+
+            if [ "$CONFLICT" = "true" ]; then
+              gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+                -X POST -f "labels[]=conflict" --silent 2>/dev/null || true
+            else
+              gh api "repos/${REPO}/issues/${PR_NUMBER}/labels/conflict" \
+                -X DELETE --silent 2>/dev/null || true
+            fi
+            echo "Updated PR #${PR_NUMBER}"
+          else
+            # Create new PR via REST API
+            PR_URL=$(gh api "repos/${REPO}/pulls" \
+              -X POST \
+              -f title="$TITLE" \
+              -f body="$BODY" \
+              -f head="upstream-sync" \
+              -f base="main" \
+              --jq '.html_url')
+            echo "Created PR: ${PR_URL}"
+          fi
