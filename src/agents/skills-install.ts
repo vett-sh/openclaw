@@ -58,6 +58,7 @@ function formatScanFindingDetail(
 async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<string[]> {
   const warnings: string[] = [];
   const skillName = entry.skill.name;
+  const gateUrl = process.env.ENCLAVE_INSTALL_GATE_URL;
   const skillDir = path.resolve(entry.skill.baseDir);
 
   try {
@@ -79,6 +80,26 @@ async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<strin
     warnings.push(
       `Skill "${skillName}" code safety scan failed (${String(err)}). Installation continues; run "openclaw security audit --deep" after install.`,
     );
+  }
+
+  // Enclave: block on critical findings when install gate is configured
+  if (gateUrl && warnings.some((w) => w.startsWith("WARNING:"))) {
+    const criticalWarning = warnings.find((w) => w.startsWith("WARNING:"));
+    throw new Error(`BLOCKED: ${criticalWarning}`);
+  }
+
+  // Enclave: external approval gate
+  if (gateUrl) {
+    const approved = await fetch(gateUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skill: entry.skill.name, dir: entry.skill.baseDir }),
+    })
+      .then((r) => r.ok)
+      .catch(() => false);
+    if (!approved) {
+      throw new Error(`BLOCKED: Skill "${skillName}" not approved by Enclave install gate`);
+    }
   }
 
   return warnings;
@@ -405,7 +426,20 @@ export async function installSkill(params: SkillInstallRequest): Promise<SkillIn
   }
 
   const spec = findInstallSpec(entry, params.installId);
-  const warnings = await collectSkillInstallScanWarnings(entry);
+  let warnings: string[];
+  try {
+    warnings = await collectSkillInstallScanWarnings(entry);
+  } catch (scanError) {
+    // Enclave: collectSkillInstallScanWarnings throws when install gate blocks
+    const message = scanError instanceof Error ? scanError.message : String(scanError);
+    return {
+      ok: false,
+      message,
+      stdout: "",
+      stderr: "",
+      code: null,
+    };
+  }
   if (!spec) {
     return withWarnings(
       {
