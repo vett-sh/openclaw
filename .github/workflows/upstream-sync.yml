@@ -1,0 +1,174 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          NEW_COUNT=$(git rev-list origin/main..upstream/main --count)
+          if [ "$NEW_COUNT" -eq 0 ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "commit_count=$NEW_COUNT" >> "$GITHUB_OUTPUT"
+            echo "$NEW_COUNT new upstream commit(s) to sync"
+          fi
+
+      - name: Identify fork-only commits
+        if: steps.check.outputs.up_to_date == 'false'
+        id: fork_commits
+        run: |
+          FORK_SHAS=$(git rev-list upstream/main..origin/main --reverse)
+          if [ -z "$FORK_SHAS" ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "No fork-only commits (fast-forward)"
+          else
+            echo "$FORK_SHAS" > /tmp/fork-shas.txt
+            COUNT=$(echo "$FORK_SHAS" | wc -l | tr -d ' ')
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+            git log upstream/main..origin/main --reverse --format='- %h %s' > /tmp/fork-commits-list.txt
+            echo "$COUNT fork commit(s) to replay:"
+            cat /tmp/fork-commits-list.txt
+          fi
+
+      - name: Rebase fork commits onto upstream
+        if: steps.check.outputs.up_to_date == 'false'
+        id: rebase
+        env:
+          FORK_COUNT: ${{ steps.fork_commits.outputs.count }}
+        run: |
+          git checkout -B upstream-sync upstream/main
+
+          if [ "$FORK_COUNT" -eq 0 ]; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git cherry-pick $(cat /tmp/fork-shas.txt | tr '\n' ' '); then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "All fork commits replayed cleanly"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+            echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
+            FAILED_SHA=$(git rev-parse CHERRY_PICK_HEAD 2>/dev/null || echo "unknown")
+            echo "failed_sha=$FAILED_SHA" >> "$GITHUB_OUTPUT"
+            echo "Cherry-pick failed on ${FAILED_SHA:0:7}, conflicts: $CONFLICTS"
+            git cherry-pick --abort
+            git reset --hard upstream/main
+          fi
+
+      # ── Clean path: force-push main, clean up ─────────────────────────
+
+      - name: Update main
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outputs.conflict != 'true'
+        run: |
+          git push --force origin upstream-sync:main
+          echo "main updated (upstream + fork commits rebased)"
+
+      - name: Close stale PR and delete branch
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outputs.conflict != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          PR=$(gh api "repos/${REPO}/pulls" \
+            --jq '[.[] | select(.head.ref=="upstream-sync" and .state=="open")][0].number // empty' \
+            2>/dev/null || true)
+          if [ -n "$PR" ] && [ "$PR" != "null" ]; then
+            gh api "repos/${REPO}/pulls/${PR}" -X PATCH -f state=closed --silent
+            echo "Closed stale PR #${PR}"
+          fi
+          git push origin --delete upstream-sync 2>/dev/null || true
+
+      # ── Conflict path: push branch, open/update PR ────────────────────
+
+      - name: Push upstream-sync branch
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outputs.conflict == 'true'
+        run: git push --force origin upstream-sync
+
+      - name: Open or update conflict PR
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          REPO: ${{ github.repository }}
+          COUNT: ${{ steps.check.outputs.commit_count }}
+          CONFLICT_FILES: ${{ steps.rebase.outputs.conflict_files }}
+          FAILED_SHA: ${{ steps.rebase.outputs.failed_sha }}
+        run: |
+          FORK_LIST=$(cat /tmp/fork-commits-list.txt)
+          FAILED_SUBJECT=$(git log -1 --format='%s' "$FAILED_SHA" 2>/dev/null || echo "unknown")
+          FORK_SHAS=$(cat /tmp/fork-shas.txt | tr '\n' ' ')
+
+          {
+            echo "## Upstream Sync — Conflict"
+            echo ""
+            echo "**${COUNT} new upstream commit(s)** could not be synced automatically."
+            echo ""
+            echo "Cherry-pick of \`${FAILED_SHA:0:7}\` (\`${FAILED_SUBJECT}\`) failed on:"
+            echo "\`\`\`"
+            echo "$CONFLICT_FILES" | tr ',' '\n'
+            echo "\`\`\`"
+            echo ""
+            echo "### Fork commits to replay"
+            echo "$FORK_LIST"
+            echo ""
+            echo "### Resolution"
+            echo "\`\`\`bash"
+            echo "git fetch origin && git fetch upstream main"
+            echo "git checkout -B main upstream/main"
+            echo "git cherry-pick ${FORK_SHAS}"
+            echo "# resolve conflicts, then:"
+            echo "git push --force origin main"
+            echo "\`\`\`"
+            echo ""
+            echo "The next scheduled run will clean up this PR automatically."
+          } > /tmp/pr-body.md
+
+          BODY=$(cat /tmp/pr-body.md)
+          TITLE="sync: upstream conflict — manual resolution needed"
+
+          # Find existing open PR
+          PR=$(gh api "repos/${REPO}/pulls" \
+            --jq '[.[] | select(.head.ref=="upstream-sync" and .state=="open")][0].number // empty' \
+            2>/dev/null || true)
+
+          if [ -n "$PR" ] && [ "$PR" != "null" ]; then
+            gh api "repos/${REPO}/pulls/${PR}" -X PATCH \
+              -f title="$TITLE" -f body="$BODY" --silent
+            echo "Updated PR #${PR}"
+          else
+            PR_URL=$(gh api "repos/${REPO}/pulls" -X POST \
+              -f title="$TITLE" -f body="$BODY" \
+              -f head="upstream-sync" -f base="main" \
+              --jq '.html_url')
+            echo "Created PR: ${PR_URL}"
+          fi
