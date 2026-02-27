@@ -490,7 +490,10 @@ async function installPluginFromPackageDir(
     forcedScanEntries.push(resolvedEntry);
   }
 
-  // Scan plugin source for dangerous code patterns (warn-only; never blocks install)
+  // Scan plugin source for dangerous code patterns
+  // Enclave: when ENCLAVE_INSTALL_GATE_URL is set, block on critical findings
+  const gateUrl = process.env.ENCLAVE_INSTALL_GATE_URL;
+  let hasCritical = false;
   try {
     const scanSummary = await skillScanner.scanDirectoryWithSummary(params.packageDir, {
       includeFiles: forcedScanEntries,
@@ -503,6 +506,7 @@ async function installPluginFromPackageDir(
       logger.warn?.(
         `WARNING: Plugin "${pluginId}" contains dangerous code patterns: ${criticalDetails}`,
       );
+      hasCritical = true;
     } else if (scanSummary.warn > 0) {
       logger.warn?.(
         `Plugin "${pluginId}" has ${scanSummary.warn} suspicious code pattern(s). Run "openclaw security audit --deep" for details.`,
@@ -512,6 +516,26 @@ async function installPluginFromPackageDir(
     logger.warn?.(
       `Plugin "${pluginId}" code safety scan failed (${String(err)}). Installation continues; run "openclaw security audit --deep" after install.`,
     );
+  }
+
+  // Enclave: block on critical findings when install gate is configured
+  if (gateUrl && hasCritical) {
+    return { ok: false, error: `BLOCKED: Plugin "${pluginId}" contains dangerous code patterns` };
+  }
+
+  // Enclave: external approval gate
+  if (gateUrl) {
+    const gateRes = await fetch(gateUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manager: "plugin", spec: pluginId }),
+    }).catch(() => null);
+    if (!gateRes?.ok) {
+      return {
+        ok: false,
+        error: `BLOCKED: Plugin "${pluginId}" not approved by Enclave install gate`,
+      };
+    }
   }
 
   const extensionsDir = params.extensionsDir
